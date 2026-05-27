@@ -270,6 +270,20 @@ impl EscrowContract {
         }
     }
 
+    fn checked_add_i128(env: &Env, a: i128, b: i128) -> Result<i128, EscrowError> {
+        a.checked_add(b).ok_or_else(|| {
+            log!(env, "checked_add_i128 overflow: {} + {}", a, b);
+            EscrowError::InvalidInput
+        })
+    }
+
+    fn checked_sub_i128(env: &Env, a: i128, b: i128) -> Result<i128, EscrowError> {
+        a.checked_sub(b).ok_or_else(|| {
+            log!(env, "checked_sub_i128 underflow: {} - {}", a, b);
+            EscrowError::InvalidInput
+        })
+    }
+
     fn sync_dispute_to_job_registry(env: &Env, job_id: u64) -> Result<(), EscrowError> {
         Self::bump_instance_ttl(env);
         let Some(registry_contract) = env
@@ -524,9 +538,8 @@ impl EscrowContract {
 
         let mut total_milestones_amount = 0i128;
         for m in job.milestones.iter() {
-            total_milestones_amount = total_milestones_amount
-                .checked_add(m.amount)
-                .ok_or(EscrowError::ArithmeticOverflow)?;
+            total_milestones_amount =
+                Self::checked_add_i128(&env, total_milestones_amount, m.amount)?;
         }
 
         if total_milestones_amount != amount {
@@ -599,15 +612,8 @@ impl EscrowContract {
         milestone.status = MilestoneStatus::Released;
         job.milestones.set(idx, milestone.clone());
 
-        job.released_amount = job
-            .released_amount
-            .checked_add(milestone.amount)
-            .ok_or(EscrowError::ArithmeticOverflow)?;
-
-        // Idempotency invariant: released can never exceed total
-        if job.released_amount > job.total_amount {
-            return Err(EscrowError::InvalidState);
-        }
+        job.released_amount =
+            Self::checked_add_i128(&env, job.released_amount, milestone.amount)?;
 
         let next_status = if job.released_amount == job.total_amount {
             EscrowStatus::Completed
@@ -843,30 +849,18 @@ impl EscrowContract {
         Self::bump_job_ttl(&env, &key);
         assert!(job.status == EscrowStatus::Disputed, "job not disputed");
 
-        // Enforce strict timeout: resolution must occur within the dispute window
-        let now = env.ledger().timestamp();
-        if job.dispute_deadline > 0 && now > job.dispute_deadline {
-            panic_with_error!(&env, EscrowError::DisputeResolutionExpired);
-        }
-
-        let remaining = job.total_amount - job.released_amount;
-        let total_payout = payee_amount
-            .checked_add(payer_amount)
-            .expect("payout overflow");
+        let remaining = Self::checked_sub_i128(&env, job.total_amount, job.released_amount)
+            .expect("invalid escrow balance state");
+        let total_payout = Self::checked_add_i128(&env, payee_amount, payer_amount)
+            .expect("invalid dispute payout state");
         assert!(total_payout <= remaining, "payout exceeds remaining funds");
 
         let next_status = EscrowStatus::Resolved;
         job.status
             .validate_transition(&next_status)
             .expect("invalid state transition");
-        job.released_amount = job
-            .released_amount
-            .checked_add(total_payout)
-            .expect("released_amount overflow");
-        assert!(
-            job.released_amount <= job.total_amount,
-            "double-spend: released exceeds total"
-        );
+        job.released_amount = Self::checked_add_i128(&env, job.released_amount, total_payout)
+            .expect("released amount overflow");
         job.status = next_status;
 
         enter_reentrancy_guard(&env);
@@ -916,7 +910,7 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
-        let remaining = job.total_amount - job.released_amount;
+        let remaining = Self::checked_sub_i128(&env, job.total_amount, job.released_amount)?;
 
         let next_status = EscrowStatus::Refunded;
         job.status.validate_transition(&next_status)?;
@@ -1055,6 +1049,35 @@ impl EscrowContract {
             statuses.push_back(m.status);
         }
         statuses
+    }
+
+    /// Read-only helper exposing active escrow configuration.
+    pub fn get_escrow_config(env: Env) -> Result<(Address, Address, Option<Address>), EscrowError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::NotInitialized)?;
+        let agent_judge: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AgentJudge)
+            .ok_or(EscrowError::NotInitialized)?;
+        let job_registry: Option<Address> = env.storage().instance().get(&DataKey::JobRegistry);
+        Self::bump_instance_ttl(&env);
+        Ok((admin, agent_judge, job_registry))
+    }
+
+    /// Read-only helper exposing unreleased escrow balance for a job.
+    pub fn get_remaining_balance(env: Env, job_id: u64) -> Result<i128, EscrowError> {
+        let key = DataKey::Job(job_id);
+        let job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
+        Self::bump_job_ttl(&env, &key);
+        Self::checked_sub_i128(&env, job.total_amount, job.released_amount)
     }
 
     /// Configure multisig for a job. Only callable by client during Setup phase.
@@ -2295,6 +2318,36 @@ mod test {
 
         cc.initialize(&admin, &agent_judge);
         cc.get_job(&999u64);
+    }
+
+    #[test]
+    fn test_getters_for_config_and_remaining_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+        cc.add_milestone(&1u64, &4000i128);
+        cc.add_milestone(&1u64, &6000i128);
+        cc.deposit(&1u64, &10000i128);
+        cc.release_milestone(&1u64, &client);
+
+        let (stored_admin, stored_agent, registry) = cc.get_escrow_config();
+        assert_eq!(stored_admin, admin);
+        assert_eq!(stored_agent, agent_judge);
+        assert_eq!(registry, None);
+
+        assert_eq!(cc.get_remaining_balance(&1u64), 6000);
     }
 
     #[test]
