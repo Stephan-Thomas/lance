@@ -2219,7 +2219,7 @@ mod test {
 
         cc.initialize(&admin, &agent_judge);
         cc.create_job(&77u64, &client, &freelancer, &token_addr);
-        cc.cancel_brief(&77u64, &client).unwrap();
+        cc.cancel_brief(&77u64, &client);
 
         let job = cc.get_job(&77u64);
         assert_eq!(job.status, EscrowStatus::Refunded);
